@@ -3,7 +3,6 @@
 ########################################################################
 name: thatdamtoolbox
 
-
 ########################################################################
 # Network Bridge "damnet"
 ########################################################################
@@ -89,7 +88,7 @@ services:
 
 
   ########################################################################
-  # 3. capture daemon (needs /dev + v4l2, so bridge is fine)
+  # 3. Golang Services (needs /dev + v4l2, so bridge is fine)
   ########################################################################
   capture-daemon:
     build:
@@ -118,6 +117,78 @@ services:
     depends_on:
       - rabbitmq
 
+  api-gateway:
+    build:
+      context: .
+      dockerfile: host/services/api-gateway/Dockerfile
+    image: cdaprod/api-gateway:latest
+    container_name: thatdamtoolbox-api-gateway
+    networks: [damnet]
+    # Avoid port collision with video-api:8080 (already exposed on host)
+    # If your nginx "gw" uses host-mode and points to 127.0.0.1:API_PORT,
+    # set API_PORT=8081 there to front this gateway.
+    ports: ["8081:8080"]
+    environment:
+      # Upstreams inside the bridge network
+      BACKEND_URL:       "http://video-api:8080"
+      CAMERA_PROXY_URL:  "http://camera-proxy:8000"
+      OVERLAY_HUB_URL:   "http://overlay-hub:8090"
+      # Optional: tighten CORS/WS if your gateway enforces it
+      # ALLOWED_ORIGINS:  "http://localhost:3000,http://video-web:3000"
+    depends_on:
+      - video-api
+      - camera-proxy
+      - overlay-hub
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8080/overlay/hints || curl -fs http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  overlay-hub:
+    build:
+      context: .
+      dockerfile: host/services/overlay-hub/Dockerfile
+    image: cdaprod/overlay-hub:latest
+    container_name: thatdamtoolbox-overlay-hub
+    networks: [damnet]
+    ports: ["8090:8090"]   # expose for local dev/ops; safe to keep bridge-only if you prefer
+    environment: {}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8090/healthz || exit 1"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  camera-proxy:
+    build:
+      context: .
+      dockerfile: host/services/camera-proxy/Dockerfile
+    image: cdaprod/camera-proxy:latest
+    container_name: thatdamtoolbox-camera-proxy
+    networks: [damnet]
+    privileged: true
+    devices:
+      - /dev:/dev
+    environment:
+      BACKEND_URL:        "http://video-api:8080"
+      FRONTEND_URL:       "http://video-web:3000"
+      CAPTURE_DAEMON_URL: "http://capture-daemon:9000"
+      OVERLAY_HUB_URL:    "http://overlay-hub:8090"
+      # Lock down WS origins in prod (leave empty for dev)
+      ALLOWED_ORIGINS:    "http://localhost:3000,http://video-web:3000"
+    depends_on:
+      - video-api
+      - capture-daemon
+      - overlay-hub
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
 
   ########################################################################
   # 4. FastAPI back-end (mapped => reachable on host :8080)
