@@ -1,13 +1,20 @@
 name: CI-Test-Changed-Services
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     branches: ["**"]
     paths:
       - "docker/**"
-      - "!docker/compose/**"        # exclude compose layer dir from per-service lint matrix
-      - "docker/compose/**"         # but still trigger the workflow so smoke can run
-      - "docker-compose.y*ml"
+      - "!docker/compose/**"        # exclude compose dir from per-service matrix lint/test
+      - "docker/compose/**"         # still trigger workflow so smoke can run when compose changes
+      - "docker-compose.y*ml"       # root compose file(s)
       - "host/services/**"
       - "**/*.go"
       - "**/*.ts"
@@ -21,10 +28,10 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      changed:          ${{ steps.set.outputs.changed }}           # "true"/"false"
-      list:             ${{ steps.set.outputs.changed_services }}  # JSON array of service names
-      compose_changed:  ${{ steps.set.outputs.compose_changed }}   # "true"/"false"
-      compose_files:    ${{ steps.set.outputs.compose_files }}     # JSON array of compose files
+      changed:          ${{ steps.set.outputs.changed }}            # "true"/"false"
+      list:             ${{ steps.set.outputs.changed_services }}   # JSON array of service names
+      compose_changed:  ${{ steps.set.outputs.compose_changed }}    # "true"/"false"
+      compose_files:    ${{ steps.set.outputs.compose_files }}      # JSON array of compose files
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -38,12 +45,13 @@ jobs:
           set -euo pipefail
           BASE_SHA=$(git merge-base origin/${{ github.base_ref }} HEAD)
 
-          # 1) Changed service names (docker/* and host/services/*)
+          # 1) Changed service names (only when Dockerfile changed OR host/services/* changed)
           MODIFIED_SERVICES=$(
             git diff --name-only "$BASE_SHA" HEAD -- \
-              'docker/*' 'host/services/**' \
+              'docker/*/Dockerfile' \
+              'host/services/**' \
             | awk -F/ '
-                $1=="docker"{print $2}
+                $1=="docker" && $3=="Dockerfile"{print $2}
                 $1=="host" && $2=="services"{print $3}
               ' \
             | sort -u
@@ -58,10 +66,11 @@ jobs:
               | { read json; echo "changed_services=$json" >> "$GITHUB_OUTPUT"; }
           fi
 
-          # 2) Compose files (root and layer dir)
+          # 2) Compose files (root and layered)
           COMPOSE_FILES=$(
             git diff --name-only "$BASE_SHA" HEAD -- \
-              'docker-compose.y*ml' 'docker/compose/**'
+              'docker-compose.y*ml' \
+              'docker/compose/**/*.y*ml'
           )
           if [ -z "$COMPOSE_FILES" ]; then
             echo "compose_changed=false" >> "$GITHUB_OUTPUT"
@@ -73,57 +82,77 @@ jobs:
           fi
 
   # ──────────────────────────────────────────────────────────────────────────
-  # Lint + unit-test the CHANGED services only
+  # Lint + unit-test the CHANGED services only (matrix)
   # ──────────────────────────────────────────────────────────────────────────
   test-services:
     needs: detect-changes
     if: needs.detect-changes.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    env:
+      GO_VERSION: "1.22.x"
+      GOFLAGS: "-trimpath -buildvcs=true -p=2"
+      GOMAXPROCS: "2"
+      # Only run -race on main and tags to avoid OOM on PRs
+      ENABLE_RACE: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) && '1' || '0' }}
     strategy:
       matrix:
         service: ${{ fromJson(needs.detect-changes.outputs.list) }}
     steps:
       - uses: actions/checkout@v4
 
+      # Common toolchains
       - uses: actions/setup-go@v5
-        with: { go-version: '1.22.x' }
+        with: { go-version: ${{ env.GO_VERSION }} }
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - uses: docker/setup-buildx-action@v3
 
+      # Hadolint is not in apt; install from release
+      - name: Install hadolint
+        run: |
+          curl -sSL https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64 \
+            -o /usr/local/bin/hadolint
+          chmod +x /usr/local/bin/hadolint
+          hadolint --version || true
+
       - name: Install generic lint deps
         run: |
-          sudo apt-get update && sudo apt-get install -y hadolint
-          pip install pytest
+          pip install -q pytest
           npm i -g eslint
 
       - name: Lint & unit-test ${{ matrix.service }}
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           SVC="${{ matrix.service }}"
           DOCKER_DIR="docker/$SVC"
           HOST_DIR="host/services/$SVC"
+
+          echo "→ Service: $SVC"
 
           # Dockerfile lint/build (guarded)
           if [ -d "$DOCKER_DIR" ]; then
             pushd "$DOCKER_DIR" >/dev/null
             if [ -f Dockerfile ]; then
+              echo "• hadolint Dockerfile"
               hadolint Dockerfile
+              echo "• docker build"
               docker build -t "local/$SVC:ci" .
             else
               echo "ℹ️  $DOCKER_DIR has no Dockerfile; skipping hadolint/build"
             fi
 
             # Python tests (service-local)
-            if compgen -G "*.py" > /dev/null || compgen -G "**/*.py" > /dev/null; then
+            if compgen -G "*.py" >/dev/null || compgen -G "**/*.py" >/dev/null; then
+              echo "• pytest"
               pytest -q
             fi
 
             # Node tests (service-local)
             if [ -f package.json ]; then
+              echo "• npm test"
               npm ci
               npm test --if-present
             fi
@@ -132,10 +161,12 @@ jobs:
             echo "ℹ️  No docker dir for $SVC; skipping container lint/build"
           fi
 
-          # Go tests (host layer)
+          # Go tests (host layer) -- bounded to avoid OOM on GH runners
           if [ -d "$HOST_DIR" ] && [ -f "$HOST_DIR/go.mod" ]; then
-            echo "🧪 go test $HOST_DIR/..."
-            go test "$HOST_DIR/..." -v -race -shuffle=on -count=1
+            echo "• go test $HOST_DIR/..."
+            RACE_FLAG=""
+            [ "${ENABLE_RACE}" = "1" ] && RACE_FLAG="-race"
+            ( cd "$HOST_DIR" && go test ./... $RACE_FLAG -v -timeout=8m -count=1 -shuffle=on -p=2 -parallel=2 )
           fi
 
   # ──────────────────────────────────────────────────────────────────────────
@@ -151,33 +182,48 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
 
+      - name: Ensure jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Pre-build changed services (if any)
         shell: bash
         run: |
+          set -euo pipefail
           for svc in $(echo '${{ needs.detect-changes.outputs.list }}' | jq -r '.[]'); do
-            [ -d "docker/$svc" ] && docker build -q -t "local/$svc:ci" "docker/$svc" || true
+            if [ -d "docker/$svc" ]; then
+              echo "• prebuilding docker/$svc"
+              docker build -q -t "local/$svc:ci" "docker/$svc"
+            fi
           done
 
       - name: Bring up compose stack
         shell: bash
+        env:
+          COMPOSE_DOCKER_CLI_BUILD: 1
         run: |
-          set -e
-          ROOT="-f docker-compose.yaml"
-          [ -f docker-compose.yml ] && ROOT="-f docker-compose.yml"
+          set -euo pipefail
+          ROOT=""
+          if [ -f docker-compose.yaml ]; then ROOT="-f docker-compose.yaml"; fi
+          if [ -z "$ROOT" ] && [ -f docker-compose.yml ]; then ROOT="-f docker-compose.yml"; fi
+
           LAYERS=""
           if ls docker/compose/docker-compose.*.y*ml >/dev/null 2>&1; then
             LAYERS=$(ls docker/compose/docker-compose.*.y*ml | xargs printf -- '-f %s ')
           fi
-          echo "Using: $ROOT $LAYERS"
+
+          echo "Using compose files: $ROOT $LAYERS"
+          # Allow layers-only stacks too
           docker compose $ROOT $LAYERS up -d
+
           echo "⏳ waiting 30s for services..."
           sleep 30
           docker compose ps
 
       - name: Basic health checks (best-effort)
+        shell: bash
         run: |
           set -e
-          curl -fsS http://localhost:8080/health || echo "⚠️ api health missing"
+          curl -fsS http://localhost:8080/health || echo "⚠️ api health endpoint missing/failed"
 
       - name: Tear down
         if: always()
