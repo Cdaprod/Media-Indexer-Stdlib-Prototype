@@ -178,6 +178,8 @@ jobs:
       needs.detect-changes.outputs.changed == 'true' ||
       needs.detect-changes.outputs.compose_changed == 'true'
     runs-on: ubuntu-latest
+    env:
+      COMPOSE_DOCKER_CLI_BUILD: 1
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -196,10 +198,9 @@ jobs:
             fi
           done
 
-      - name: Bring up compose stack
+      - name: Resolve compose files (root + layers) and export
+        id: files
         shell: bash
-        env:
-          COMPOSE_DOCKER_CLI_BUILD: 1
         run: |
           set -euo pipefail
           ROOT=""
@@ -211,13 +212,29 @@ jobs:
             LAYERS=$(ls docker/compose/docker-compose.*.y*ml | xargs printf -- '-f %s ')
           fi
 
-          echo "Using compose files: $ROOT $LAYERS"
-          # Allow layers-only stacks too
-          docker compose $ROOT $LAYERS up -d
+          FILES="$ROOT $LAYERS"
+          echo "FILES=$FILES"
+          echo "FILES=$FILES" >> "$GITHUB_OUTPUT"
+          echo "COMPOSE_FILES=$FILES" >> "$GITHUB_ENV"
 
+      - name: Validate merged compose config
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          docker compose $COMPOSE_FILES config >/dev/null
+          echo "✅ compose config is valid"
+
+      - name: Bring up compose stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Using compose files: $COMPOSE_FILES"
+          # shellcheck disable=SC2086
+          docker compose $COMPOSE_FILES up -d
           echo "⏳ waiting 30s for services..."
           sleep 30
-          docker compose ps
+          docker compose $COMPOSE_FILES ps
 
       - name: Basic health checks (best-effort)
         shell: bash
@@ -227,4 +244,9 @@ jobs:
 
       - name: Tear down
         if: always()
-        run: docker compose down -v --remove-orphans
+        shell: bash
+        run: |
+          set -e
+          echo "Tearing down with same compose files: $COMPOSE_FILES"
+          # shellcheck disable=SC2086
+          docker compose $COMPOSE_FILES down -v --remove-orphans
