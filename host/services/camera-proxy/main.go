@@ -361,14 +361,19 @@ func (dp *DeviceProxy) registerWithDaemon(ctx context.Context) error {
 
 // negotiateWithDaemon performs the SDP offer/answer exchange.
 func (dp *DeviceProxy) negotiateWithDaemon(pc *webrtc.PeerConnection) error {
+	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo); err != nil {
+		return err
+	}
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		return err
 	}
+	gather := webrtc.GatheringCompletePromise(pc)
 	if err := pc.SetLocalDescription(offer); err != nil {
 		return err
 	}
-	body, err := json.Marshal(map[string]any{"sdp": offer})
+	<-gather
+	body, err := json.Marshal(map[string]any{"sdp": pc.LocalDescription()})
 	if err != nil {
 		return err
 	}

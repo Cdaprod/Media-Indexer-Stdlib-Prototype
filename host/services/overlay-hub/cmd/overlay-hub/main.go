@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/MicahParks/keyfunc"
-	"github.com/golang-jwt/jwt/v5"
+	"github.com/golang-jwt/jwt/v4"
 )
 
 var jwks *keyfunc.JWKS

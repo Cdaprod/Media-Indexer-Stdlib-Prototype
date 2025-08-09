@@ -15,7 +15,7 @@ var overlayKey = []byte("overlay-demo-key")
 
 // signToken mimics api-gateway token issuance for tests.
 func signToken(agentID string) string {
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT","kid":"overlay"}`))
 	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"` + agentID + `"}`))
 	h := hmac.New(sha256.New, overlayKey)
 	h.Write([]byte(header + "." + payload))

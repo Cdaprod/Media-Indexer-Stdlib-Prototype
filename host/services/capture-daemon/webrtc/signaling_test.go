@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pion/webrtc/v3"
 )
@@ -24,15 +25,20 @@ func TestOfferCreatesSessions(t *testing.T) {
 			t.Fatalf("peer connection: %v", err)
 		}
 		defer pc.Close()
+		if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo); err != nil {
+			t.Fatalf("add transceiver: %v", err)
+		}
 		offer, err := pc.CreateOffer(nil)
 		if err != nil {
 			t.Fatalf("create offer: %v", err)
 		}
+		gather := webrtc.GatheringCompletePromise(pc)
 		if err := pc.SetLocalDescription(offer); err != nil {
 			t.Fatalf("set local: %v", err)
 		}
+		<-gather
 		buf := new(bytes.Buffer)
-		_ = json.NewEncoder(buf).Encode(map[string]any{"sdp": offer})
+		_ = json.NewEncoder(buf).Encode(map[string]any{"sdp": pc.LocalDescription()})
 		resp, err := http.Post(srv.URL+"/webrtc/offer", "application/json", buf)
 		if err != nil {
 			t.Fatalf("post offer: %v", err)
@@ -55,7 +61,6 @@ func TestOfferCreatesSessions(t *testing.T) {
 
 	for _, s := range Sessions() {
 		s.PC.Close()
-		removeSession(s.PC)
 	}
 }
 
@@ -85,10 +90,10 @@ func TestSessionConcurrency(t *testing.T) {
 				return
 			}
 			sess.PC.Close()
-			removeSession(sess.PC)
 		}()
 	}
 	wg.Wait()
+	time.Sleep(100 * time.Millisecond)
 	if len(Sessions()) != 0 {
 		t.Fatalf("expected 0 sessions after cleanup, got %d", len(Sessions()))
 	}
